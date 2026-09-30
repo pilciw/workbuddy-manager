@@ -1,0 +1,105 @@
+# 定时把上游 ithtelab/workbuddy-manager 的改动同步到本 fork。
+#
+# 为什么需要这个：GitHub **没有**「自动 sync fork」开关 —— fork 页面上那个
+# 「Sync fork」按钮只能手点。这里调用的是同一个官方接口：
+#   POST /repos/{owner}/{repo}/merge-upstream
+# 它把 fork 的父仓库（上游）默认分支的改动合并进来。
+#
+# 合并产生的新提交会触发 Build Image 自动重建镜像。但用 GITHUB_TOKEN 产生的
+# 提交不一定触发 push 事件，所以下面第二步会核对：这个新提交有没有对应的运行，
+# 没有就主动 dispatch 一次 Build Image —— 避免「同步成功但镜像没重建」这种静默失效。
+#
+# 部署仍然是手动的（服务器上 docker compose pull && up -d），这是刻意的：
+# 自动同步 + 自动构建已经很快，最后一步留给你看一眼再上线。
+
+name: Sync Upstream
+
+on:
+  schedule:
+    # 测试期：每 10 分钟一次（GitHub 定时任务最小间隔 5 分钟，且高峰期可能延迟）
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write    # merge-upstream 需要写权限
+  actions: write     # 补触发 Build Image 时需要
+
+# 连续触发时排队，避免两次合并互相打断
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 合并上游
+        id: merge
+        run: |
+          set -euo pipefail
+          echo "目标：$REPO 的 $BRANCH ← 上游默认分支"
+          resp=$(curl -sS -w '\n%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$REPO/merge-upstream" \
+            -d "{\"branch\":\"$BRANCH\"}")
+          code=$(printf '%s' "$resp" | tail -n1)
+          body=$(printf '%s' "$resp" | sed '$d')
+          echo "HTTP $code"
+          echo "$body"
+          if [ "$code" != "200" ]; then
+            echo "::error::合并失败（HTTP $code）——若上游有冲突需手动处理；若是 403 说明本工作流的令牌没有合并权限"
+            exit 1
+          fi
+          {
+            echo "merge_type=$(printf '%s' "$body" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("merge_type",""))')"
+            echo "sha=$(printf '%s' "$body" | python3 -c 'import json,sys;print((json.load(sys.stdin).get("commit") or {}).get("sha",""))')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 确认 Build Image 已被触发（没触发就补一次）
+        if: steps.merge.outputs.merge_type != 'none' && steps.merge.outputs.merge_type != ''
+        env:
+          SHA: ${{ steps.merge.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SHA" ]; then echo "上游有新提交但没拿到 sha，跳过补触发"; exit 0; fi
+          echo "上游已合并到 $SHA，检查是否已有构建运行…"
+          for i in 1 2 3 4 5 6; do
+            n=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/actions/runs?head_sha=$SHA&per_page=1" \
+              | python3 -c 'import json,sys;print(json.load(sys.stdin).get("total_count",0))')
+            if [ "$n" != "0" ]; then
+              echo "已有 $n 个运行绑定到 $SHA —— 说明 push 事件正常触发了构建，无需补触发"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "没有运行绑定到 $SHA，主动触发 Build Image"
+          code=$(curl -sS -o /tmp/dispatch.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/build-image.yml/dispatches" \
+            -d "{\"ref\":\"$BRANCH\"}")
+          echo "dispatch HTTP $code"
+          cat /tmp/dispatch.json || true
+          if [ "$code" != "204" ]; then echo "::error::补触发失败"; exit 1; fi
+
+      - name: 结果
+        run: |
+          {
+            echo "## 上游同步"
+            echo ""
+            echo "- merge_type：\`${{ steps.merge.outputs.merge_type }}\`"
+            echo "- 新提交：\`${{ steps.merge.outputs.sha }}\`"
+            echo ""
+            if [ "${{ steps.merge.outputs.merge_type }}" = "none" ]; then
+              echo "上游没有新提交，本次什么都没做。"
+            else
+              echo "已合并上游改动；镜像重建见 [Build Image](../actions/workflows/build-image.yml)。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
